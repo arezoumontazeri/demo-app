@@ -19,6 +19,8 @@ celery_app.conf.update(
     result_expires=3600,            # result keys expire after 1 h -> real "expired keys" in Row 5
     task_track_started=True,
     broker_connection_retry_on_startup=True,
+    worker_send_task_events=True,   # events for the monitor (same as celery -E)
+    worker_prefetch_multiplier=1,   # each process reserves 1 message -> queue depth stays meaningful
 )
 
 # endpoint name -> (registered task name, queue)

@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import socket
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -38,8 +39,10 @@ LATENCY = Histogram(
 TASKS_SUBMITTED = Counter("app_tasks_submitted_total", "Celery tasks submitted", ["task", "queue"])
 TASK_SUBMIT_ERRORS = Counter("app_task_submit_errors_total", "Celery task submit failures", ["task"])
 DEP_UP = Gauge("app_dependency_up", "1 if dependency answered the last readiness check", ["dependency"])
-STORAGE_OK = Gauge("app_storage_check_success", "1 if the last /mnt/shared write+read+delete passed")
-STORAGE_SECONDS = Gauge("app_storage_check_duration_seconds", "Duration of the last storage check")
+STORAGE_OK = Gauge("app_storage_check_success", "1 if the last /mnt/shared write+read+delete passed", ["path"])
+STORAGE_SECONDS = Gauge("app_storage_check_duration_seconds", "Duration of the last storage check", ["path"])
+STORAGE_LAST = Gauge("app_storage_check_last_timestamp_seconds", "Unix time the last storage check finished", ["path"])
+STORAGE_INTERVAL_S = float(os.environ.get("STORAGE_CHECK_INTERVAL_S", "15"))
 
 # ---- Dependencies
 pool = ConnectionPool(
@@ -48,7 +51,8 @@ pool = ConnectionPool(
     timeout=5, open=False, kwargs={"connect_timeout": 2},
 )
 redis_client = redis_lib.Redis.from_url(redis_url(0), socket_timeout=2, socket_connect_timeout=2)
-storage_lock = asyncio.Lock()
+probe_lock = threading.Lock()   # held by the probe THREAD: stays held while NFS hangs
+check_lock = asyncio.Lock()     # serializes callers (background loop + endpoint)
 _schema_ready = False
 
 
@@ -73,8 +77,10 @@ async def lifespan(app: FastAPI):
         ensure_schema()
     except Exception as exc:  # DB may still be starting: readiness will show it
         log.warning("schema not ready at startup", extra={"fields": {"error": str(exc)}})
+    checker = asyncio.create_task(storage_loop())
     log.info("startup complete", extra={"fields": {"host": HOSTNAME}})
     yield
+    checker.cancel()
     pool.close()
 
 
@@ -219,23 +225,29 @@ def task_status(task_id: str):
 
 
 def _storage_probe() -> None:
-    probe_dir = SHARED_DIR / ".probe"
-    probe_dir.mkdir(parents=True, exist_ok=True)
-    path = probe_dir / f"{HOSTNAME}.txt"
-    token = uuid.uuid4().hex
-    path.write_text(token)
-    if path.read_text() != token:
-        raise IOError("read-back mismatch")
-    path.unlink()
+    if not probe_lock.acquire(blocking=False):
+        raise RuntimeError("previous probe still running")
+    try:
+        probe_dir = SHARED_DIR / ".probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        path = probe_dir / f"{HOSTNAME}.txt"
+        token = uuid.uuid4().hex
+        path.write_text(token)
+        if path.read_text() != token:
+            raise IOError("read-back mismatch")
+        path.unlink()
+    finally:
+        probe_lock.release()
 
 
-@app.get("/api/storage/status")
-async def storage_status():
-    if storage_lock.locked():
-        STORAGE_OK.set(0)
-        return JSONResponse({"ok": False, "error": "previous check still running (storage hung?)"},
-                            status_code=503)
-    async with storage_lock:
+async def run_storage_check() -> dict:
+    path = str(SHARED_DIR)
+    async with check_lock:
+        if probe_lock.locked():
+            STORAGE_OK.labels(path).set(0)
+            err = "previous probe still running (storage hung?)"
+            log.error("storage check skipped", extra={"fields": {"error": err, "path": path}})
+            return {"ok": False, "path": path, "duration_ms": None, "error": err}
         start = time.perf_counter()
         try:
             await asyncio.wait_for(asyncio.to_thread(_storage_probe), timeout=STORAGE_TIMEOUT_S)
@@ -245,9 +257,24 @@ async def storage_status():
         except Exception as exc:
             ok, error = False, f"{exc.__class__.__name__}: {exc}"
         elapsed = time.perf_counter() - start
-        STORAGE_OK.set(1 if ok else 0)
-        STORAGE_SECONDS.set(elapsed)
+        STORAGE_OK.labels(path).set(1 if ok else 0)
+        STORAGE_SECONDS.labels(path).set(elapsed)
+        STORAGE_LAST.labels(path).set(time.time())
         if not ok:
-            log.error("storage check failed", extra={"fields": {"error": error, "path": str(SHARED_DIR)}})
-        return JSONResponse({"ok": ok, "path": str(SHARED_DIR), "duration_ms": round(elapsed * 1000, 1),
-                             "error": error}, status_code=200 if ok else 503)
+            log.error("storage check failed", extra={"fields": {"error": error, "path": path}})
+        return {"ok": ok, "path": path, "duration_ms": round(elapsed * 1000, 1), "error": error}
+
+
+async def storage_loop() -> None:
+    while True:
+        try:
+            await run_storage_check()
+        except Exception:
+            log.exception("storage loop error")
+        await asyncio.sleep(STORAGE_INTERVAL_S)
+
+
+@app.get("/api/storage/status")
+async def storage_status():
+    result = await run_storage_check()
+    return JSONResponse(result, status_code=200 if result["ok"] else 503)
