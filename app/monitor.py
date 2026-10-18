@@ -35,6 +35,7 @@ ERRORS = Counter("celery_lab_monitor_errors_total", "Monitor loop errors", ["loo
 for task_name, queue in TASK_QUEUE.items():
     for outcome in OUTCOMES.values():
         TASKS_TOTAL.labels(task_name, queue, outcome)
+    DURATION.labels(task_name, queue)   # born at 0, so rate() sees the first observations
 for q in QUEUES:
     ACTIVE_WORKERS.labels(q).set(0)
     EXECUTING.labels(q).set(0)

@@ -43,7 +43,8 @@ def low_priority_job(self, duration_s: float = 5.0, fail: bool = False, fail_rat
 def collect_data(self, duration_s: float = 2.0, fail: bool = False, fail_rate: float = 0.0):
     time.sleep(duration_s)
     if _should_fail(fail, fail_rate):
-        log.warning("collect attempt failed, will retry", extra={"fields": {
+        last = self.request.retries >= self.max_retries
+        log.warning("collect attempt failed, giving up" if last else "collect attempt failed, will retry", extra={"fields": {
             "task_id": self.request.id, "retries": self.request.retries}})
         # After max_retries, Celery re-raises this exception and the task FAILS
         raise self.retry(exc=RuntimeError("upstream unavailable (simulated)"), countdown=2)
